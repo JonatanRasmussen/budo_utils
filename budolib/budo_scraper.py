@@ -6,9 +6,10 @@ import string
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Union, Optional
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
 from urllib.parse import urlparse
 import pandas as pd
-import requests
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
@@ -225,7 +226,7 @@ class BudoPersistence:
     """Custom persistence and FileIO solution for Budo's personal projects."""
     # Paths and folders
     _workspace_path = BudoConfig.workspace_path
-    _in_recursion_loop = False # read_textfile calls itself after file decompression, track this
+    _in_recursion_loop: bool = False #for when read_textfile calls itself after file decompression
 
     @staticmethod
     def try_read_textfile(path: Union[Path, str]) -> str:
@@ -387,18 +388,11 @@ class BudoPersistence:
             path = Path(path)
         if not path.is_absolute():
             path = BudoPersistence._workspace_path / path
-        resolved_path = path.resolve()
-        BudoPersistence._ensure_dir_exists(resolved_path)
-        return resolved_path
-
-    @staticmethod
-    def _ensure_dir_exists(path: Union[Path, str]) -> None:
-        """Ensure the directory exists by creating missing folders."""
-        if isinstance(path, str):
-            path = Path(path)
         directory = path.parent
         if not directory.exists():
             directory.mkdir(parents=True, exist_ok=True)
+        resolved_path = path.resolve()
+        return resolved_path
 
 
 class BudoWebscraper:
@@ -549,7 +543,7 @@ class BudoWebscraper:
 
 
 class BudoTrimmer:
-    """Text and HTML trimming for Budo's personal projects."""
+    """Text and HTML trimming rulesets for Budo's personal projects."""
 
     _trimmer_registry: Dict[str, 'BudoTrimmer'] = {}
 
@@ -565,31 +559,29 @@ class BudoTrimmer:
         # Trimmers are not automatically added to registry, use register_trimmer() instead
 
     @staticmethod
-    def register_trimmer(target_url: str, start: str, end: str,
-                         replacements: Optional[Dict[str, str]] = None,
-                         validations: Optional[List[str]] = None) -> None:
-        """Create and register a trimmer to be chosen for urls of type target_url"""
+    def register_trimming_ruleset(target_url: str, start: str, end: str,
+                                  replacements: Optional[Dict[str, str]] = None,
+                                  validations: Optional[List[str]] = None) -> None:
+        """Create and register a trimmer ruleset to be used for urls matching target_url"""
         new_trimmer = BudoTrimmer(target_url, start, end, replacements, validations)
-        BudoTrimmer._add_trimmer_to_registry(target_url, new_trimmer)
+        if target_url in BudoTrimmer._trimmer_registry:
+            existing_trimmer = BudoTrimmer._trimmer_registry[target_url]
+            if not BudoTrimmer._trimmers_are_equal(new_trimmer, existing_trimmer):
+                BudoLogger.warning(f"Existing trimmer with target_url {target_url} was overwritten")
+        BudoTrimmer._trimmer_registry[target_url] = new_trimmer
 
     @staticmethod
     def trim_html(url: str, html: str, trimmer: Optional['BudoTrimmer'] = None) -> str:
-        """
-        Trim html by using a trimmer picked from the following priority list:
-        1. Use trimmer passed as function parameter
-        2. Check registry for exactly one trimmer with a target_url that is a substring of url
-        3. If zero or multiple trimmers are found in step 2, do no trimming
-        """
+        """ Find the trimming ruleset that matches the url and apply it on the html """
         if trimmer is not None: # If a trimmer was passed as function parameter, use that
             return trimmer.trim_and_validate(html)
-        # Check the trimmer registry for any trimmers with a matching target_url
         matches: List[BudoTrimmer] = []
         for key, value in BudoTrimmer._trimmer_registry.items():
-            if key in url:
+            if key in url: # Check the registry for any trimmers with a matching target_url
                 matches.append(value)
         if len(matches) == 1: # If exactly one trimmer is found, use that
             return matches[0].trim_and_validate(html)
-        if len(matches) > 1: # If zero or multiple trimmers are found, do no trimming
+        if len(matches) > 1: # If not exactly one trimmer is found, do no trimming
             BudoLogger.warning(f"Url {url} matched {len(matches)} trimmers. Trimming is skipped")
         return html
 
@@ -609,12 +601,33 @@ class BudoTrimmer:
     @staticmethod
     def _trim_start_and_end(text_to_trim: str, start: str, end: str) -> str:
         """Trim away everything before 'start' and everything after 'end'"""
-        start_index = text_to_trim.find(start)
-        if start_index != -1 and len(start) != 0:
-            text_to_trim = text_to_trim[start_index:]
-        end_index = text_to_trim.rfind(end)
-        if end_index != -1:
-            text_to_trim = text_to_trim[:end_index + len(end)]
+
+        def _trim_start(text: str, start: str) -> str:
+            """Trim away everything before 'start' """
+            start_indices = [i for i in range(len(text)) if text.startswith(start, i)]
+            if len(start_indices) == 0:
+                BudoLogger.warning("'start' string not found in the text.")
+                return text
+            if len(start_indices) > 1:
+                BudoLogger.warning("'start' string found multiple times in the text.")
+                return text
+            start_index = start_indices[0]
+            return text[start_index:]
+
+        def _trim_end(text: str, end: str) -> str:
+            """Trim away everything after 'end' """
+            end_indices = [i for i in range(len(text)) if text.startswith(end, i)]
+            if len(end_indices) == 0:
+                BudoLogger.warning("'end' string not found in the text.")
+                return text
+            if len(end_indices) > 1:
+                BudoLogger.warning("'end' string found multiple times in the text.")
+                return text
+            end_index = end_indices[-1]
+            return text[:end_index + len(end)]
+
+        text_to_trim = _trim_start(text_to_trim, start)
+        text_to_trim = _trim_end(text_to_trim, end)
         return text_to_trim
 
     @staticmethod
@@ -635,11 +648,14 @@ class BudoTrimmer:
         return text_to_trim
 
     @staticmethod
-    def _add_trimmer_to_registry(target_url: str, trimmer: 'BudoTrimmer') -> None:
-        """Add trimmer to registry. Raise warning in case of key collision"""
-        if target_url in BudoTrimmer._trimmer_registry:
-            BudoLogger.warning(f"Existing trimmer with target_url {target_url} was overwritten")
-        BudoTrimmer._trimmer_registry[target_url] = trimmer
+    def _trimmers_are_equal(trimmer1: 'BudoTrimmer', trimmer2: 'BudoTrimmer') -> bool:
+        """Compares if two trimmers are equal in their target_url and ruleset"""
+        equal_url = trimmer1.target_url == trimmer2.target_url
+        equal_start = trimmer1.start == trimmer2.start
+        equal_end = trimmer1.end == trimmer2.end
+        equal_replace = trimmer1.replacements == trimmer2.replacements
+        equal_validate = trimmer1.validations == trimmer2.validations
+        return equal_url and equal_start and equal_end and equal_replace and equal_validate
 
 
 class BudoHtml:
@@ -716,7 +732,12 @@ class BudoHtml:
     @staticmethod
     def _send_request(url: str, timeout: Union[int,float] = 10) -> str:
         """Send an HTTP GET request to the specified URL and return the response text."""
-        return requests.get(url, timeout=timeout).text
+        try:
+            with urlopen(url, timeout=timeout) as response:
+                return response.read().decode('utf-8')
+        except (URLError, HTTPError) as e:
+            BudoLogger.error(f"A url or http error occurred: {e}")
+            return ""
 
     @staticmethod
     def _write_html_to_disk(url: str, html: str, path: Optional[Path] = None) -> None:
@@ -752,21 +773,32 @@ class BudoHtml:
     @staticmethod
     def _generate_filename(url: str) -> str:
         """
-        Generate a filename from a URL, removing invalid characters.
-        Example: "https://example.com/path?query=123" becomes "example_com_path_query_123
+        Generate a filename from a URL, extracting only the path and query after the domain.
+        Example: "https://example.com/path?query=123" becomes "path_query_123"
         """
+        # Parse the URL
+        parsed_url = urlparse(url)
+
+        # Get the path and query
+        path_and_query = parsed_url.path + parsed_url.query
+
+        # Remove the leading '/' if present
+        if path_and_query.startswith('/'):
+            path_and_query = path_and_query[1:]
+
         # Define the set of valid characters (alphanumeric and some punctuation)
-        valid_chars = f"-_.() {string.ascii_letters}{string.digits}"
+        valid_chars = f"-_.{string.ascii_letters}{string.digits}"
 
         # Remove any characters not in the valid set
-        sanitized_filename = ''.join(c if c in valid_chars else '_' for c in url)
+        sanitized_filename = ''.join(c if c in valid_chars else '_' for c in path_and_query)
 
-        # Remove leading and trailing whitespace and replace spaces with underscores
-        sanitized_filename = sanitized_filename.strip().replace(' ', '_')
+        # Replace '/' with '_'
+        sanitized_filename = sanitized_filename.replace('/', '_')
 
-        # Remove 'http___' or 'https___' from the beginning of the filename
-        if sanitized_filename.startswith('http___'):
-            sanitized_filename = sanitized_filename[7:]
-        elif sanitized_filename.startswith('https___'):
-            sanitized_filename = sanitized_filename[8:]
+        # Remove leading and trailing underscores
+        sanitized_filename = sanitized_filename.strip('_')
+
+        # If the result is empty, use a default name
+        if not sanitized_filename:
+            sanitized_filename = ''.join(c if c in valid_chars else '_' for c in url)
         return sanitized_filename
