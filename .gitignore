@@ -2,6 +2,7 @@
 # Cached wowhead htmls
 webcache
 wowhead_items
+wowhead_item_csv
 wowhead_zones
 
 
